@@ -2,7 +2,7 @@
 
 **Memory Capsule Craft** is a "Private Journaling Cloud" that runs on top of [Craft](https://craft.do) and AI. It transforms your daily Craft journal entries into a rich, insightful dashboard with mood tracking, theme analysis, and automated reflections.
 
-![Dashboard Preview](public/dashboard-preview.png) *Add a screenshot here if available*
+![Dashboard Preview](public/dashboard-preview.png)
 
 ## ✨ Features
 
