@@ -3,9 +3,9 @@
 import { useState, useEffect } from "react";
 import { Button } from "@/components/ui/button";
 import { Card, CardContent, CardDescription, CardFooter, CardHeader, CardTitle } from "@/components/ui/card";
-import { CraftClient, type CraftDocument, type CraftBlock, type CraftTextBlock } from "@/lib/craft-api";
-import { DashboardManager } from "@/lib/dashboard-manager";
+import { CraftClient, type CraftBlock, type CraftTextBlock } from "@/lib/craft-api";
 import { LLMService, type JournalAnalysis } from "@/lib/llm-service";
+import { JournalService } from "@/lib/journal-service";
 import { getSettings } from "@/lib/storage";
 import { Loader2, CheckCircle2, AlertCircle } from "lucide-react";
 
@@ -31,10 +31,11 @@ export default function JournalPage() {
       setLoading(true);
       try {
         const client = new CraftClient(settings.craftToken);
+        const llm = new LLMService(settings.openaiKey || ""); // Key might be missing here but checked later
+        const journalService = new JournalService(client, llm);
         
         // 1. Find "Journals" document
-        const docs = await client.listDocuments();
-        const journalsDoc = docs.find(d => d.title === "Journals" && !d.isDeleted);
+        const journalsDoc = await journalService.findJournalsDoc();
         
         if (!journalsDoc) {
           setError("Could not find a document named 'Journals'. Please create one.");
@@ -54,7 +55,6 @@ export default function JournalPage() {
         // 3. Filter for stale entries (pages that don't have "Memory Capsule Insights")
         const staleEntries = journalBlock.content.filter(block => {
           // Only process pages (which are usually text blocks with page style or actual page type if API returns it)
-          // But our types say 'page' is a type.
           if (block.type !== "page" && (block.type !== "text" || (block as CraftTextBlock).textStyle !== "page")) return false; 
           
           // Check if it has already been processed
@@ -79,134 +79,6 @@ export default function JournalPage() {
     fetchEntries();
   }, []);
 
-  const processEntry = async (entryId: string, client: CraftClient, llm: LLMService) => {
-    // 1. Fetch full entry content
-    const entryBlock = await client.getBlock(entryId, 5);
-    
-    // Extract text from the entry
-    const extractText = (blocks: CraftBlock[]): string => {
-      return blocks.map(b => {
-        const text = (b.type === "text" ? (b as CraftTextBlock).markdown : "") || "";
-        const childrenText = b.content ? extractText(b.content) : "";
-        return `${text}\n${childrenText}`;
-      }).join("\n");
-    };
-    
-    const text = entryBlock.content ? extractText(entryBlock.content) : "";
-
-    // 2. Analyze with LLM
-    const result = await llm.analyzeEntry(text);
-
-    // 3. Write back to Craft
-    // 3. Write back to Craft as JSON code block
-    const jsonContent = JSON.stringify(result, null, 2);
-    const markdown = `
-# Memory Capsule Insights
-
-\`\`\`json
-${jsonContent}
-\`\`\`
-`;
-
-    await client.insertBlocks(entryId, [
-      {
-        type: "text",
-        markdown: "Memory Capsule Insights",
-        textStyle: "body",
-        listStyle: "toggle"
-      },
-      {
-        type: "code",
-        rawCode: jsonContent,
-        language: "json",
-        indentationLevel: 1
-      }
-    ]);
-
-    // Update Dashboard Index
-    try {
-        if (journalsDocId) {
-            const dashboardManager = new DashboardManager(client, journalsDocId);
-            const currentData = await dashboardManager.getDashboardData() || {
-                totalEntries: 0,
-                avgMood: "0",
-                streak: 0,
-                themes: [],
-                dailyMoods: [],
-                lastUpdated: new Date().toISOString()
-            };
-
-        // Update stats
-        const newTotalEntries = currentData.totalEntries + 1;
-        
-        // Update avg mood
-        const currentTotalMood = parseFloat(currentData.avgMood) * currentData.totalEntries;
-        const newMood = result.mood || 0;
-        const newAvgMood = ((currentTotalMood + newMood) / newTotalEntries).toFixed(1);
-
-        // Update themes
-        const newThemes = [...currentData.themes];
-        if (result.themes) {
-            result.themes.forEach((t: string) => {
-                const existing = newThemes.find(th => th.name === t);
-                if (existing) {
-                    existing.count++;
-                } else {
-                    newThemes.push({ name: t, count: 1 });
-                }
-            });
-        }
-        newThemes.sort((a, b) => b.count - a.count); // Keep sorted
-
-        // Update daily moods
-        const newDailyMoods = [...currentData.dailyMoods];
-        
-        // Find entry to get date
-        const entry = entries.find(e => e.id === entryId);
-        
-        if (entry && (entry as CraftTextBlock).markdown && result.mood) {
-             // Assuming markdown title is date
-             const dateStr = (entry as CraftTextBlock).markdown || "";
-             newDailyMoods.push({ date: dateStr, mood: result.mood });
-        }
-        
-        // Recalculate streak (simplified: just check if we have consecutive days in newDailyMoods)
-        // Or just increment if today is consecutive? 
-        // Let's do a proper streak calc from dailyMoods
-        const uniqueDates = Array.from(new Set(newDailyMoods.map(m => new Date(m.date).toDateString()))).map(d => new Date(d).getTime()).sort((a, b) => b - a);
-        let streak = 0;
-        if (uniqueDates.length > 0) {
-            streak = 1;
-            let currentDate = uniqueDates[0];
-            for (let i = 1; i < uniqueDates.length; i++) {
-                const diff = (currentDate - uniqueDates[i]) / (1000 * 60 * 60 * 24);
-                if (diff <= 1.5) { // Allow some slack for timezones, basically 1 day diff
-                    streak++;
-                    currentDate = uniqueDates[i];
-                } else {
-                    break;
-                }
-            }
-        }
-
-        await dashboardManager.updateDashboardData({
-            totalEntries: newTotalEntries,
-            avgMood: newAvgMood,
-            streak: streak,
-            themes: newThemes,
-            dailyMoods: newDailyMoods,
-            lastUpdated: new Date().toISOString()
-        });
-
-        }
-    } catch (e) {
-        console.error("Failed to update dashboard index", e);
-        // Don't fail the whole process if dashboard update fails
-    }
-
-    return result;
-  };
-
   const handleProcess = async () => {
     if (!selectedEntryId) return;
 
@@ -224,8 +96,9 @@ ${jsonContent}
     try {
       const client = new CraftClient(settings.craftToken);
       const llm = new LLMService(settings.openaiKey);
+      const journalService = new JournalService(client, llm);
 
-      const result = await processEntry(selectedEntryId, client, llm);
+      const result = await journalService.processEntry(selectedEntryId, journalsDocId || undefined);
       
       setAnalysis(result);
       setSuccess(true);
@@ -260,6 +133,7 @@ ${jsonContent}
     try {
       const client = new CraftClient(settings.craftToken);
       const llm = new LLMService(settings.openaiKey);
+      const journalService = new JournalService(client, llm);
 
       const total = entries.length;
       let processedCount = 0;
@@ -277,7 +151,7 @@ ${jsonContent}
             console.error("Entry has no ID, skipping:", entry);
             continue;
           }
-          await processEntry(entry.id, client, llm);
+          await journalService.processEntry(entry.id, journalsDocId || undefined);
           
           // Remove from list immediately after success
           setEntries(prev => prev.filter(e => e.id !== entry.id));

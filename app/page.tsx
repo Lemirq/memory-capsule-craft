@@ -3,13 +3,16 @@
 import { Card, CardContent, CardDescription, CardHeader, CardTitle } from "@/components/ui/card";
 import { Button } from "@/components/ui/button";
 import Link from "next/link";
-import { ArrowRight, BarChart3, BookOpen, Calendar, TrendingUp } from "lucide-react";
+import { ArrowRight, BarChart3, BookOpen, Calendar, TrendingUp, Loader2 } from "lucide-react";
 import { useEffect, useState } from "react";
 import { CraftClient, type CraftBlock, type CraftTextBlock } from "@/lib/craft-api";
 import { DashboardManager, DashboardData } from "@/lib/dashboard-manager";
 import ResponsiveWordCloud from "@/components/WordCloud";
 import { getSettings } from "@/lib/storage";
 import { LineChart, Line, XAxis, YAxis, Tooltip, ResponsiveContainer } from 'recharts';
+import { JournalService } from "@/lib/journal-service";
+import { LLMService } from "@/lib/llm-service";
+import { toast } from "sonner";
 
 export default function Dashboard() {
   const [stats, setStats] = useState<{
@@ -26,91 +29,145 @@ export default function Dashboard() {
     themes: []
   });
   const [moodData, setMoodData] = useState<any[]>([]);
-  const [recentThemes, setRecentThemes] = useState<{name: string, count: number, impact: string}[]>([]);
+  const [dashboardData, setDashboardData] = useState<DashboardData | null>(null);
   const [loading, setLoading] = useState(true);
+  const [processingToday, setProcessingToday] = useState(false);
   const [error, setError] = useState<string | null>(null);
 
-  useEffect(() => {
-    const fetchData = async () => {
-      const settings = getSettings();
-      if (!settings?.craftToken) {
+  const fetchData = async () => {
+    const settings = getSettings();
+    if (!settings?.craftToken) {
+      setLoading(false);
+      return;
+    }
+
+    try {
+      const client = new CraftClient(settings.craftToken);
+      
+      // 1. Find "Journals" document
+      const docs = await client.listDocuments();
+      const journalsDoc = docs.find(d => d.title === "Journals" && !d.isDeleted);
+      
+      if (!journalsDoc) {
         setLoading(false);
         return;
       }
 
-      try {
-        const client = new CraftClient(settings.craftToken);
-        
-        // 1. Find "Journals" document
-        const docs = await client.listDocuments();
-        const journalsDoc = docs.find(d => d.title === "Journals" && !d.isDeleted);
-        
-        if (!journalsDoc) {
-          setLoading(false);
-          return;
-        }
-
-        // 2. Fetch all children (entries) with maxDepth=5 to get content
-        const journalBlock = await client.getBlock(journalsDoc.id, 5);
-        
-        if (!journalBlock.content) {
-          setLoading(false);
-          return;
-        }
-
-        // 3. Fetch Dashboard Data
-        const dashboardManager = new DashboardManager(client, journalsDoc.id);
-        const dashboardData = await dashboardManager.getDashboardData();
-
-        if (dashboardData) {
-            setStats({
-                totalEntries: dashboardData.totalEntries,
-                avgMood: Number(dashboardData.avgMood),
-                streak: dashboardData.streak,
-                dominantEmotion: dashboardData.themes.length > 0 ? dashboardData.themes[0].name : "N/A",
-                themes: dashboardData.themes
-            });
-            
-            // Transform dailyMoods for chart
-            const chartData = dashboardData.dailyMoods.map(m => ({
-                date: new Date(m.date).toLocaleDateString('en-US', { month: 'short', day: 'numeric' }),
-                mood: m.mood
-            }));
-            // Sort by date
-            chartData.sort((a, b) => new Date(a.date).getTime() - new Date(b.date).getTime());
-            setMoodData(chartData);
-            
-            // Recent themes
-            setRecentThemes(dashboardData.themes.slice(0, 5).map(t => ({
-                name: t.name,
-                count: t.count,
-                impact: t.count > 5 ? "High" : t.count > 2 ? "Medium" : "Low"
-            })));
-
-        } else {
-             setStats({
-                totalEntries: 0,
-                avgMood: 0,
-                streak: 0,
-                dominantEmotion: "N/A",
-                themes: []
-            });
-            setMoodData([]);
-            setRecentThemes([]);
-        }
-        
+      // 2. Fetch all children (entries) with maxDepth=5 to get content
+      const journalBlock = await client.getBlock(journalsDoc.id, 5);
+      
+      if (!journalBlock.content) {
         setLoading(false);
-
-        setLoading(false);
-      } catch (err) {
-        console.error("Failed to load dashboard", err);
-        setError("Failed to load dashboard data. Please check your API token.");
-        setLoading(false);
+        return;
       }
-    };
 
-    fetchData();
+      // 3. Fetch Dashboard Data
+      const dashboardManager = new DashboardManager(client, journalsDoc.id);
+      const dashboardData = await dashboardManager.getDashboardData();
+
+      if (dashboardData) {
+          setDashboardData(dashboardData);
+          setStats({
+              totalEntries: dashboardData.totalEntries,
+              avgMood: Number(dashboardData.avgMood),
+              streak: dashboardData.streak,
+              dominantEmotion: dashboardData.themes.length > 0 ? dashboardData.themes[0].name : "N/A",
+              themes: dashboardData.themes
+          });
+          
+          // Transform dailyMoods for chart
+          const chartData = dashboardData.dailyMoods.map(m => ({
+              date: new Date(m.date).toLocaleDateString('en-US', { month: 'short', day: 'numeric' }),
+              mood: m.mood
+          }));
+          // Sort by date
+          chartData.sort((a, b) => new Date(a.date).getTime() - new Date(b.date).getTime());
+          setMoodData(chartData);
+
+      } else {
+           setStats({
+              totalEntries: 0,
+              avgMood: 0,
+              streak: 0,
+              dominantEmotion: "N/A",
+              themes: []
+          });
+          setMoodData([]);
+          setDashboardData(null);
+      }
+      
+      setLoading(false);
+    } catch (err) {
+      console.error("Failed to load dashboard", err);
+      setError("Failed to load dashboard data. Please check your API token.");
+      setLoading(false);
+    }
+  };
+
+  fetchData();
+  useEffect(() => {
   }, []);
+
+  const handleProcessToday = async () => {
+    setProcessingToday(true);
+    const settings = getSettings();
+    if (!settings?.craftToken || !settings?.openaiKey) {
+        toast.error("Missing API Keys", {
+            description: "Please configure your Craft and OpenAI keys in Settings.",
+            action: <Link href="/settings">Settings</Link>
+        });
+        setProcessingToday(false);
+        return;
+    }
+
+    try {
+        const client = new CraftClient(settings.craftToken);
+        const llm = new LLMService(settings.openaiKey);
+        const journalService = new JournalService(client, llm);
+
+        // 1. Find today's entry
+        const todayEntry = await journalService.findTodayJournalEntry();
+
+        if (!todayEntry) {
+            toast.error("No Entry Found", {
+                description: "Nothing was logged today in a journal.",
+            });
+            setProcessingToday(false);
+            return;
+        }
+
+        // 2. Check if already processed
+        const hasInsights = todayEntry.content?.some(child => 
+            child.type === "text" && (child as CraftTextBlock).markdown?.includes("Memory Capsule Insights") && (child as CraftTextBlock).listStyle === "toggle"
+        );
+
+        if (hasInsights) {
+             toast.info("Already Processed", {
+                description: "Today's entry has already been analyzed.",
+            });
+            setProcessingToday(false);
+            return;
+        }
+
+        // 3. Process entry
+        await journalService.processEntry(todayEntry.id!, undefined);
+
+        toast.success("Success!", {
+            description: "Today's entry has been processed and insights added.",
+        });
+
+        // 4. Reload data
+        await fetchData();
+
+    } catch (error) {
+        console.error("Failed to process today's entry", error);
+        toast.error("Processing Failed", {
+            description: "An error occurred while analyzing your entry.",
+        });
+    } finally {
+        setProcessingToday(false);
+  }
+  };
 
   if (loading) {
     return (
@@ -133,12 +190,19 @@ export default function Dashboard() {
           </p>
         </div>
         <div className="flex items-center space-x-2">
-          <Link href="/journal">
-            <Button>
-              Process Today's Entry
-              <ArrowRight className="ml-2 h-4 w-4" />
+            <Button onClick={handleProcessToday} disabled={processingToday}>
+              {processingToday ? (
+                  <>
+                    <Loader2 className="mr-2 h-4 w-4 animate-spin" />
+                    Processing...
+                  </>
+              ) : (
+                  <>
+                    Process Today's Entry
+                    <ArrowRight className="ml-2 h-4 w-4" />
+                  </>
+              )}
             </Button>
-          </Link>
         </div>
       </div>
 
@@ -265,6 +329,31 @@ export default function Dashboard() {
               />
             </CardContent>
           </Card>
+      </div>
+
+      <div className="grid grid-cols-1 md:grid-cols-2 gap-4">
+        <Link href="/monthly" className="block">
+            <Card className="hover:bg-muted/50 transition-colors cursor-pointer h-full">
+                <CardHeader>
+                    <CardTitle>Monthly Summary</CardTitle>
+                    <CardDescription>View aggregated insights for each month.</CardDescription>
+                </CardHeader>
+                <CardContent>
+                    <ArrowRight className="h-6 w-6 text-muted-foreground" />
+                </CardContent>
+            </Card>
+        </Link>
+        <Link href="/yearly" className="block">
+            <Card className="hover:bg-muted/50 transition-colors cursor-pointer h-full">
+                <CardHeader>
+                    <CardTitle>Yearly Memory Rewind</CardTitle>
+                    <CardDescription>A look back at your year in review.</CardDescription>
+                </CardHeader>
+                <CardContent>
+                    <ArrowRight className="h-6 w-6 text-muted-foreground" />
+                </CardContent>
+            </Card>
+        </Link>
       </div>
     </div>
   );
